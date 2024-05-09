@@ -707,6 +707,7 @@ pub async fn download_and_sketch(
             let send_failed_clone = send_failed.clone();
             let download_path_clone = download_path.clone(); // Clone the path for each task
             let send_errors_clone = error_sender.clone();
+            let processed_count_clone = processed_count.clone();
 
             let dna_sigs = dna_sig_templates.clone();
             let prot_sigs = prot_sig_templates.clone();
@@ -747,6 +748,7 @@ pub async fn download_and_sketch(
                     }
                 }
                 drop(send_errors_clone);
+                processed_count_clone.fetch_add(1, Ordering::SeqCst);
             });
         }
     });
