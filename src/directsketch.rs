@@ -5,7 +5,7 @@ use camino::Utf8PathBuf as PathBuf;
 use chrono::Utc;
 use needletail::parse_fastx_reader;
 use regex::Regex;
-use reqwest::Client;
+use reqwest::{Client, StatusCode};
 use std::collections::HashMap;
 use std::fs::{self, create_dir_all};
 use std::io::Cursor;
@@ -14,6 +14,7 @@ use std::sync::Arc;
 use tokio::fs::File;
 use tokio::io::{AsyncWriteExt, BufWriter};
 use tokio::sync::Semaphore;
+use tokio::time::{sleep, Duration};
 use tokio_util::compat::Compat;
 
 use pyo3::prelude::*;
@@ -185,33 +186,50 @@ async fn download_with_retry(
         let response = client.get(url).send().await;
 
         match response {
-            Ok(resp) if resp.status().is_success() => {
-                let data = resp
-                    .bytes()
-                    .await
-                    .context("Failed to read bytes from response")?;
-
-                if let Some(md5) = expected_md5 {
-                    let computed_hash = format!("{:x}", md5::compute(&data));
-                    if computed_hash == md5 {
-                        return Ok(data.to_vec());
-                    } else {
+            Ok(resp) => {
+                match resp.status() {
+                    StatusCode::TOO_MANY_REQUESTS => {
+                        let retry_after = resp
+                            .headers()
+                            .get("Retry-After")
+                            .and_then(|h| h.to_str().ok())
+                            .and_then(|s| s.parse::<u64>().ok())
+                            .unwrap_or(30); // Default to 30 seconds if not provided
+                        eprintln!(
+                            "429 Too Many Requests: Retrying in {} seconds...",
+                            retry_after
+                        );
+                        sleep(Duration::from_secs(retry_after)).await;
+                        continue; // Skip reducing attempts, retry immediately after sleep
+                    }
+                    StatusCode::OK => {
+                        let data = resp
+                            .bytes()
+                            .await
+                            .context("Failed to read bytes from response")?;
+                        if let Some(md5) = expected_md5 {
+                            let computed_hash = format!("{:x}", md5::compute(&data));
+                            if computed_hash == md5 {
+                                return Ok(data.to_vec());
+                            } else {
+                                last_error = Some(anyhow!(
+                                    "MD5 hash does not match. Expected: {}, Found: {}.",
+                                    md5,
+                                    computed_hash
+                                ));
+                            }
+                        } else {
+                            return Ok(data.to_vec()); // If no expected MD5 is provided, just return the data
+                        }
+                    }
+                    _ => {
                         last_error = Some(anyhow!(
-                            "MD5 hash does not match. Expected: {}, Found: {}.",
-                            md5,
-                            computed_hash
+                            "Server error status code {}: {}.",
+                            resp.status(),
+                            url
                         ));
                     }
-                } else {
-                    return Ok(data.to_vec()); // If no expected MD5 is provided, just return the data
                 }
-            }
-            Ok(resp) => {
-                last_error = Some(anyhow!(
-                    "Server error status code {}: {}. Retrying...",
-                    resp.status(),
-                    url
-                ));
             }
             Err(e) => {
                 last_error = Some(anyhow!("Failed to download file: {}. Error: {}.", url, e));
