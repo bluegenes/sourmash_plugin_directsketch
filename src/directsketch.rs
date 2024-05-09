@@ -22,7 +22,7 @@ use pyo3::prelude::*;
 use sourmash::manifest::{Manifest, Record};
 use sourmash::signature::Signature;
 
-use crate::utils::{build_siginfo, load_accession_info, parse_params_str};
+use crate::utils::{build_siginfo, load_accession_info, parse_params_str, AccessionData};
 
 #[allow(dead_code)]
 enum GenBankFileType {
@@ -628,31 +628,7 @@ pub async fn download_and_sketch(
         create_dir_all(&download_path)?;
     }
 
-    // // create channels. buffer size can be changed - here it is 4 b/c we can do 3 downloads simultaneously
-    // // to do: see whether increasing buffer size speeds things up
-    let (send_sigs, recv_sigs) = tokio::sync::mpsc::channel::<Vec<Signature>>(4);
-    let (send_failed, recv_failed) = tokio::sync::mpsc::channel::<FailedDownload>(4);
-    // // Error channel for handling task errors
-    let (error_sender, mut error_receiver) = tokio::sync::mpsc::channel::<anyhow::Error>(1);
-
-    // //  // Set up collector/writing tasks
-    let mut handles = Vec::new();
-    let sig_handle = sigwriter_handle(recv_sigs, output_sigs, error_sender.clone());
-    let failures_handle = failures_handle(failed_csv, recv_failed, error_sender.clone());
-    handles.push(sig_handle);
-    handles.push(failures_handle);
-
-    // // Worker tasks
-    let semaphore = Arc::new(Semaphore::new(3)); // Limiting concurrent downloads
-    let client = Arc::new(Client::new());
-
-    // Open the file containing the accessions synchronously
-    let (accession_info, n_accs) = load_accession_info(input_csv)?;
-    if n_accs == 0 {
-        bail!("No accessions to download and sketch.")
-    }
-
-    // // parse param string into params_vec, print error if fail
+    // parse param string into params_vec, print error if fail
     let param_result = parse_params_str(param_str);
     let params_vec = match param_result {
         Ok(params) => params,
@@ -663,72 +639,102 @@ pub async fn download_and_sketch(
     let dna_sig_templates = build_siginfo(&params_vec, "DNA");
     let prot_sig_templates = build_siginfo(&params_vec, "protein");
 
+    //create channels. buffer size can be changed - here it is 4 b/c we can do 3 downloads simultaneously
+    // to do: see whether increasing buffer size speeds things up
+    let (send_sigs, recv_sigs) = tokio::sync::mpsc::channel::<Vec<Signature>>(4);
+    let (send_failed, recv_failed) = tokio::sync::mpsc::channel::<FailedDownload>(4);
+    // // Error channel for handling task errors
+    let (error_sender, mut error_receiver) = tokio::sync::mpsc::channel::<anyhow::Error>(4);
+    // tasks channel for handling task spawning (to avoid spawning all at once)
+    let (send_tasks, mut recv_tasks) = tokio::sync::mpsc::channel::<AccessionData>(100); // Adjust channel size as needed
+
+    // Set up collector/writing tasks
+    let mut handles = Vec::new();
+    let sig_handle = sigwriter_handle(recv_sigs, output_sigs, error_sender.clone());
+    let failures_handle = failures_handle(failed_csv, recv_failed, error_sender.clone());
+    handles.push(sig_handle);
+    handles.push(failures_handle);
+
+    // // Worker tasks
+    let semaphore = Arc::new(Semaphore::new(3)); // Limiting concurrent downloads
+    let client = Arc::new(Client::new());
+
+    // Open the file containing the accessions
+    let (accession_info, n_accs) = load_accession_info(input_csv)?;
+    if n_accs == 0 {
+        bail!("No accessions to download and sketch.")
+    }
     // report every 1 percent (or every 1, whichever is larger)
-    let reporting_threshold = std::cmp::max(n_accs / 100, 1);
+    // let reporting_threshold = std::cmp::max(n_accs / 100, 1);
 
-    for (i, accinfo) in accession_info.into_iter().enumerate() {
-        py.check_signals()?; // If interrupted, return an Err automatically
-        let semaphore_clone = Arc::clone(&semaphore);
-        let client_clone = Arc::clone(&client);
-        let send_sigs = send_sigs.clone();
-        let send_failed = send_failed.clone();
-        let download_path_clone = download_path.clone(); // Clone the path for each task
-        let send_errors = error_sender.clone();
+    // Task producer -- send up to channel size tasks at once (i think?)
+    tokio::spawn(async move {
+        for accinfo in accession_info {
+            send_tasks
+                .send(accinfo)
+                .await
+                .expect("Failed to send accinfo to channel");
+        }
+        drop(send_tasks); // Close the channel after sending all tasks
+    });
 
-        let dna_sigs = dna_sig_templates.clone();
-        let prot_sigs = prot_sig_templates.clone();
+    tokio::spawn(async move {
+        while let Some(accinfo) = recv_tasks.recv().await {
+            let semaphore_clone = Arc::clone(&semaphore);
+            // let mut task_recv_clone = recv_tasks.clone();
+            let client_clone = Arc::clone(&client);
+            let send_sigs_clone = send_sigs.clone();
+            let send_failed_clone = send_failed.clone();
+            let download_path_clone = download_path.clone(); // Clone the path for each task
+            let send_errors_clone = error_sender.clone();
 
-        tokio::spawn(async move {
-            let _permit = semaphore_clone.acquire().await;
-            // Report when the permit is available and processing begins
-            if (i + 1) % reporting_threshold == 0 {
-                let percent_processed = (((i + 1) as f64 / n_accs as f64) * 100.0).round();
-                println!(
-                    "Starting accession {}/{} ({}%)",
-                    (i + 1),
-                    n_accs,
-                    percent_processed
-                );
-            }
-            // Perform download and sketch
-            let result = dl_sketch_accession(
-                &client_clone,
-                accinfo.accession.clone(),
-                accinfo.name.clone(),
-                &download_path_clone,
-                Some(retry_times),
-                keep_fastas,
-                dna_sigs,
-                prot_sigs,
-                genomes_only,
-                proteomes_only,
-                download_only,
-            )
-            .await;
-            match result {
-                Ok((sigs, failed_downloads)) => {
-                    if let Err(e) = send_sigs.send(sigs).await {
-                        eprintln!("Failed to send signatures: {}", e);
-                        let _ = send_errors.send(e.into()).await; // Send the error through the channel
-                    }
-                    for fail in failed_downloads {
-                        if let Err(e) = send_failed.send(fail).await {
-                            eprintln!("Failed to send failed download info: {}", e);
-                            let _ = send_errors.send(e.into()).await; // Send the error through the channel
+            let dna_sigs = dna_sig_templates.clone();
+            let prot_sigs = prot_sig_templates.clone();
+
+            tokio::spawn(async move {
+                let _permit = semaphore_clone.acquire().await; // Blocks until a permit is available
+
+                // Process the data
+                let result = dl_sketch_accession(
+                    &client_clone,
+                    accinfo.accession.clone(),
+                    accinfo.name.clone(),
+                    &download_path_clone,
+                    Some(retry_times),
+                    keep_fastas,
+                    dna_sigs,
+                    prot_sigs,
+                    genomes_only,
+                    proteomes_only,
+                    download_only,
+                )
+                .await;
+                match result {
+                    Ok((sigs, failed_downloads)) => {
+                        if let Err(e) = send_sigs_clone.send(sigs).await {
+                            eprintln!("Failed to send signatures: {}", e);
+                            let _ = send_errors_clone.send(e.into()).await; // Send the error through the channel
+                        }
+                        for fail in failed_downloads {
+                            if let Err(e) = send_failed_clone.send(fail).await {
+                                eprintln!("Failed to send failed download info: {}", e);
+                                let _ = send_errors_clone.send(e.into()).await; // Send the error through the channel
+                            }
                         }
                     }
+                    Err(e) => {
+                        let _ = send_errors_clone.send(e).await;
+                    }
                 }
-                Err(e) => {
-                    let _ = send_errors.send(e).await;
-                }
-            }
-            drop(send_errors);
-        });
-    }
+                drop(send_errors_clone);
+            });
+        }
+    });
+
     // drop senders as we're done sending data
-    drop(send_sigs);
-    drop(send_failed);
-    drop(error_sender);
+    // drop(send_sigs);
+    // drop(send_failed);
+    // drop(error_sender);
     // Wait for all tasks to complete
     for handle in handles {
         if let Err(e) = handle.await {
@@ -745,3 +751,15 @@ pub async fn download_and_sketch(
     }
     Ok(())
 }
+
+// Report when we spawn these taskes
+//         if (i + 1) % reporting_threshold == 0 {
+//             let percent_processed = (((i + 1) as f64 / n_accs as f64) * 100.0).round();
+//             println!(
+//                 "Starting accession {}/{} ({}%)",
+//                 (i + 1),
+//                 n_accs,
+//                 percent_processed
+//             );
+//         }
+//     }
