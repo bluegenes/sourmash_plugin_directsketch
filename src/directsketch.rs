@@ -14,6 +14,7 @@ use std::sync::Arc;
 use tokio::fs::File;
 use tokio::io::{AsyncWriteExt, BufWriter};
 use tokio::sync::Semaphore;
+use tokio::time::{timeout, Duration};
 use tokio_util::compat::Compat;
 
 use pyo3::prelude::*;
@@ -22,6 +23,8 @@ use sourmash::manifest::{Manifest, Record};
 use sourmash::signature::Signature;
 
 use crate::utils::{build_siginfo, load_accession_info, parse_params_str};
+
+const TIMEOUT_DURATION: u64 = 240; // 120 seconds / 4min
 
 #[allow(dead_code)]
 enum GenBankFileType {
@@ -87,10 +90,15 @@ async fn fetch_genbank_filename(client: &Client, accession: &str) -> Result<(Str
         "https://ftp.ncbi.nlm.nih.gov/genomes/all/{}/{}",
         db, number_path
     );
-    let directory_response = client.get(&base_url).send().await;
+
+    let directory_response = timeout(
+        Duration::from_secs(TIMEOUT_DURATION),
+        client.get(&base_url).send(),
+    )
+    .await;
 
     match directory_response {
-        Ok(response) => {
+        Ok(Ok(response)) => {
             if !response.status().is_success() {
                 return Err(anyhow!(
                     "Failed to open genome directory: HTTP {}, {}",
@@ -104,7 +112,6 @@ async fn fetch_genbank_filename(client: &Client, accession: &str) -> Result<(Str
 
             let text = response.text().await?;
             let link_regex = Regex::new(r#"<a href="([^"]*)""#)?;
-
             for cap in link_regex.captures_iter(&text) {
                 let name = &cap[1];
                 let clean_name = if name.ends_with('/') {
@@ -119,7 +126,10 @@ async fn fetch_genbank_filename(client: &Client, accession: &str) -> Result<(Str
                         .nth(1)
                         .map_or(false, |x| x.starts_with(number))
                 {
-                    return Ok((format!("{}/{}", base_url, clean_name), clean_name.into()));
+                    return Ok((
+                        format!("{}/{}", base_url, clean_name),
+                        clean_name.to_string(),
+                    ));
                 }
             }
             Err(anyhow!(
@@ -127,10 +137,18 @@ async fn fetch_genbank_filename(client: &Client, accession: &str) -> Result<(Str
                 accession
             ))
         }
-        Err(e) => {
-            // eprintln!("HTTP request failed for accession {}: {}", accession, e);
+        Ok(Err(e)) => {
+            // Handle cases where the request was made but failed (e.g., network issues, server error)
             Err(anyhow!(
                 "HTTP request failed for accession {}: {}",
+                accession,
+                e
+            ))
+        }
+        Err(e) => {
+            // Handle the timeout case
+            Err(anyhow!(
+                "Request timed out for accession {}: {}",
                 accession,
                 e
             ))
@@ -139,11 +157,13 @@ async fn fetch_genbank_filename(client: &Client, accession: &str) -> Result<(Str
 }
 
 async fn download_and_parse_md5(client: &Client, url: &str) -> Result<HashMap<String, String>> {
-    let response = client
-        .get(url)
-        .send()
-        .await
-        .context("Failed to send request")?;
+    let response = timeout(
+        Duration::from_secs(TIMEOUT_DURATION),
+        client.get(url).send(),
+    )
+    .await
+    .context("Timeout reached while sending request")?
+    .context("Failed to send request")?;
 
     let content = response
         .text()
@@ -181,10 +201,14 @@ async fn download_with_retry(
     let mut attempts = retry_count;
 
     while attempts > 0 {
-        let response = client.get(url).send().await;
+        let response = timeout(
+            Duration::from_secs(TIMEOUT_DURATION),
+            client.get(url).send(),
+        )
+        .await;
 
         match response {
-            Ok(resp) if resp.status().is_success() => {
+            Ok(Ok(resp)) if resp.status().is_success() => {
                 let data = resp
                     .bytes()
                     .await
@@ -204,8 +228,25 @@ async fn download_with_retry(
                     return Ok(data.to_vec()); // If no expected MD5 is provided, just return the data
                 }
             }
-            _ => {
-                eprintln!("Failed to download file: {}. Retrying...", url);
+            Ok(Ok(resp)) => {
+                // Handle non-success HTTP status codes
+                eprintln!(
+                    "Server responded with error status code {}: {}. Retrying...",
+                    resp.status(),
+                    url
+                );
+            }
+            Ok(Err(e)) => {
+                eprintln!(
+                    "Failed to download file: {}. Error: {}. Retrying...",
+                    url, e
+                );
+            }
+            Err(e) => {
+                eprintln!(
+                    "Timeout reached while trying to download: {}. Error: {}. Retrying...",
+                    url, e
+                );
             }
         }
 
@@ -424,9 +465,7 @@ async fn write_sig(
                 niffler::compression::Format::Gzip,
                 niffler::compression::Level::Nine,
             )?;
-            //     .map_err(|e| anyhow!("Error creating gzip writer: {}", e))?;
             gz_writer.write_all(&json_bytes)?;
-            //         .map_err(|e| anyhow!("Error writing gzip data: {}", e))?;
         }
 
         buffer.into_inner()
