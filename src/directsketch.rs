@@ -10,11 +10,12 @@ use std::collections::HashMap;
 use std::fs::{self, create_dir_all};
 use std::io::Cursor;
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::fs::File;
 use tokio::io::{AsyncWriteExt, BufWriter};
 use tokio::sync::Semaphore;
-use tokio::time::{sleep, Duration};
+use tokio::time::{interval, sleep, Duration};
 use tokio_util::compat::Compat;
 
 use pyo3::prelude::*;
@@ -664,9 +665,28 @@ pub async fn download_and_sketch(
     if n_accs == 0 {
         bail!("No accessions to download and sketch.")
     }
+    let processed_count = Arc::new(AtomicUsize::new(0));
     // report every 1 percent (or every 1, whichever is larger)
-    // let reporting_threshold = std::cmp::max(n_accs / 100, 1);
+    let reporting_threshold = std::cmp::max(n_accs / 100, 1); // report every 1%
+                                                              // let reporting_threshold = std::cmp::max(n_accs / 100, 1);
 
+    // periodic reporter
+    let processed_clone = processed_count.clone();
+    tokio::spawn(async move {
+        let mut interval = interval(Duration::from_secs(5));
+        loop {
+            interval.tick().await;
+            let count = processed_clone.load(Ordering::SeqCst);
+            if count % reporting_threshold == 0 {
+                let percent_processed = (count as f64 / n_accs as f64) * 100.0;
+                println!("Processed {}/{} ({:.0}%)", count, n_accs, percent_processed);
+                // Optionally add a condition to break the loop if needed
+            }
+            if count >= n_accs {
+                break;
+            }
+        }
+    });
     // Task producer -- send up to channel size tasks at once (i think?)
     tokio::spawn(async move {
         for accinfo in accession_info {
